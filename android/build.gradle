@@ -1,37 +1,27 @@
+plugins {
+    id "com.android.library"
+}
+
 group 'com.example.flutter_blue_elves'
 version '1.0'
 
-buildscript {
-    repositories {
-        google()
-        jcenter()
-    }
-
-    dependencies {
-        classpath 'com.android.tools.build:gradle:3.5.0'
-    }
-}
-
-rootProject.allprojects {
-    repositories {
-        google()
-        jcenter()
-    }
-}
-
-apply plugin: 'com.android.library'
-
 android {
-    compileSdkVersion 31
+    namespace 'gao.xiaolei.flutter_blue_elves'
+    compileSdk 35
 
     defaultConfig {
-        minSdkVersion 18
+        minSdk 21
     }
-    lintOptions {
+    lint {
         disable 'InvalidPackage'
     }
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+        sourceCompatibility JavaVersion.VERSION_21
+        targetCompatibility JavaVersion.VERSION_21
+    }
+    packaging {
+        jniLibs {
+            useLegacyPackaging false
+        }
     }
 }
