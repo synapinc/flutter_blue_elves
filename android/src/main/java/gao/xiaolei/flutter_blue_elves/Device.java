@@ -10,6 +10,7 @@ import android.bluetooth.BluetoothProfile;
 import android.content.Context;
 import android.os.Build;
 import android.os.Handler;
+import android.util.Log;
 import androidx.annotation.RequiresApi;
 import java.io.Serializable;
 import java.util.ArrayList;
@@ -42,6 +43,10 @@ public class Device {
     private DiscoverServiceCallback discoverServiceCallback;//发现蓝牙服务之后的回调
     private MtuChangeCallback mtuChangeCallback;//mtu被修改之后的回调
     private RssiChangeCallback rssiChangeCallback;//rssi修改之后的回调
+    private int curMtu=23;//当前mtu,请求失败时原样上报
+    // Android permits one GATT operation in flight; everything goes through this queue
+    // instead of straight to mBleGatt. Driven from the mHandler (main) thread only.
+    private GattOperationQueue gattQueue;
     private Runnable connectTimeoutCallback=()->{//连接超时的回调
         if(mBleGatt!=null){
             mBleGatt.close();//直接将连接资源关闭，这样连接回调也不会被调用
@@ -61,6 +66,54 @@ public class Device {
         this.mtuChangeCallback=mtuChangeCallback;
         this.rssiChangeCallback=rssiChangeCallback;
         this.curRssi=rssi;
+        this.gattQueue=new GattOperationQueue(new GattOperationQueue.Scheduler() {
+            @Override
+            public void postDelayed(Runnable task, long delayMs) { mHandler.postDelayed(task, delayMs); }
+
+            @Override
+            public void cancel(Runnable task) { mHandler.removeCallbacks(task); }
+        }, message -> Log.w("BLE-GATT", bleDevice.getAddress() + " " + message));
+    }
+
+    /** GATT callbacks arrive on a binder thread; the queue lives on the mHandler thread. */
+    private void completeGattOperation(String key){
+        mHandler.post(() -> gattQueue.complete(key));
+    }
+
+    private static String characteristicKey(String op,BluetoothGattCharacteristic characteristic){
+        return op+":"+characteristic.getUuid();
+    }
+
+    private static String descriptorKey(String op,BluetoothGattDescriptor descriptor){
+        return op+":"+descriptor.getCharacteristic().getUuid()+":"+descriptor.getUuid();
+    }
+
+    /** A queued GATT operation; {@code issue} returns what the stack said. */
+    private abstract class GattOp implements GattOperationQueue.Operation {
+        private final String key;
+        private final boolean coalescable;
+
+        GattOp(String key, boolean coalescable) {
+            this.key = key;
+            this.coalescable = coalescable;
+        }
+
+        @Override
+        public String key() { return key; }
+
+        @Override
+        public boolean isCoalescable() { return coalescable; }
+
+        @Override
+        public GattOperationQueue.IssueResult issue() {
+            BluetoothGatt gatt = mBleGatt;
+            if (gatt == null || connectState != 2)
+                return GattOperationQueue.IssueResult.FAILED;
+            // false from the stack almost always means another operation is still pending
+            return issue(gatt) ? GattOperationQueue.IssueResult.ISSUED : GattOperationQueue.IssueResult.BUSY;
+        }
+
+        abstract boolean issue(BluetoothGatt gatt);
     }
 
     /**
@@ -68,6 +121,7 @@ public class Device {
      */
     public void destroy(){
         mHandler.removeCallbacks(connectTimeoutCallback);//停止连接超时的定时
+        gattQueue.clear();
         if(connectState==2){//如果是已经连接才能去断开连接
             isInitiativeDisConnect=true;//标记当前是手动断开的
             mBleGatt.disconnect();//断开连接
@@ -145,7 +199,8 @@ public class Device {
             clientConfig.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
         else
             clientConfig.setValue(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE);
-        return mBleGatt.writeDescriptor(clientConfig);
+        enqueueDescriptorWrite(clientConfig,clientConfig.getValue());
+        return true;
     }
 
     /**
@@ -153,8 +208,17 @@ public class Device {
      */
     public void readDataToDevice(String serviceUuid,String characteristicUuid){
         BluetoothGattCharacteristic mBleGattCharacteristic = getBluetoothGattCharacteristic(serviceUuid,characteristicUuid);
-        if(mBleGattCharacteristic!=null)
-            mBleGatt.readCharacteristic(mBleGattCharacteristic);//读取
+        if(mBleGattCharacteristic==null)
+            return;
+        gattQueue.enqueue(new GattOp(characteristicKey("READ",mBleGattCharacteristic),true) {
+            @Override
+            boolean issue(BluetoothGatt gatt) { return gatt.readCharacteristic(mBleGattCharacteristic); }//读取
+
+            @Override
+            public void onFailed(String reason) {
+                deviceSignalCallback.signalCallback((short) 0,bleDevice.getAddress(),mBleGattCharacteristic.getUuid().toString(),false,null);
+            }
+        });
     }
 
     /**
@@ -162,11 +226,22 @@ public class Device {
      */
     public void writeDataToDevice(String serviceUuid,String characteristicUuid,boolean isNoResponse,byte[] data){
         BluetoothGattCharacteristic mBleGattCharacteristic = getBluetoothGattCharacteristic(serviceUuid,characteristicUuid);
-        if(mBleGattCharacteristic!=null){
-            mBleGattCharacteristic.setValue(data);
-            mBleGattCharacteristic.setWriteType(isNoResponse?BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE:BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);//是否是有响应写
-            mBleGatt.writeCharacteristic(mBleGattCharacteristic); //发送
-        }
+        if(mBleGattCharacteristic==null)
+            return;
+        gattQueue.enqueue(new GattOp(characteristicKey("WRITE",mBleGattCharacteristic),false) {
+            @Override
+            boolean issue(BluetoothGatt gatt) {
+                // value and type live on the shared characteristic object, so set them at issue time
+                mBleGattCharacteristic.setValue(data);
+                mBleGattCharacteristic.setWriteType(isNoResponse?BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE:BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);//是否是有响应写
+                return gatt.writeCharacteristic(mBleGattCharacteristic); //发送
+            }
+
+            @Override
+            public void onFailed(String reason) {
+                deviceSignalCallback.signalCallback((short) 1,bleDevice.getAddress(),mBleGattCharacteristic.getUuid().toString(),false,null);
+            }
+        });
     }
 
     /**
@@ -174,8 +249,17 @@ public class Device {
      */
     public void readDescriptorDataToDevice(String serviceUuid,String characteristicUuid,String descriptorUuid){
         BluetoothGattDescriptor mBleGattDescriptor = getBluetoothGattDescriptor(serviceUuid,characteristicUuid,descriptorUuid);
-        if(mBleGattDescriptor!=null)
-            mBleGatt.readDescriptor(mBleGattDescriptor);//读取
+        if(mBleGattDescriptor==null)
+            return;
+        gattQueue.enqueue(new GattOp(descriptorKey("DESC_READ",mBleGattDescriptor),true) {
+            @Override
+            boolean issue(BluetoothGatt gatt) { return gatt.readDescriptor(mBleGattDescriptor); }//读取
+
+            @Override
+            public void onFailed(String reason) {
+                deviceSignalCallback.signalCallback((short) 3,bleDevice.getAddress(),mBleGattDescriptor.getUuid().toString(),false,null);
+            }
+        });
     }
 
     /**
@@ -183,10 +267,8 @@ public class Device {
      */
     public void writeDescriptorDataToDevice(String serviceUuid,String characteristicUuid,String descriptorUuid,byte[] data){
         BluetoothGattDescriptor mBleGattDescriptor = getBluetoothGattDescriptor(serviceUuid,characteristicUuid,descriptorUuid);
-        if(mBleGattDescriptor!=null){
-            mBleGattDescriptor.setValue(data);
-            mBleGatt.writeDescriptor(mBleGattDescriptor);//写入
-        }
+        if(mBleGattDescriptor!=null)
+            enqueueDescriptorWrite(mBleGattDescriptor,data);//写入
     }
 
     /**
@@ -194,7 +276,33 @@ public class Device {
      */
     @RequiresApi(api = Build.VERSION_CODES.LOLLIPOP)
     public boolean requestMtu(int newMtu){
-        return mBleGatt.requestMtu(newMtu);
+        if(mBleGatt==null||connectState!=2)
+            return false;
+        gattQueue.enqueue(new GattOp("MTU",true) {
+            @Override
+            boolean issue(BluetoothGatt gatt) { return gatt.requestMtu(newMtu); }
+
+            @Override
+            public void onFailed(String reason) {
+                mtuChangeCallback.mtuChangeCallback(bleDevice.getAddress(),false,curMtu);
+            }
+        });
+        return true;
+    }
+
+    private void enqueueDescriptorWrite(BluetoothGattDescriptor descriptor,byte[] data){
+        gattQueue.enqueue(new GattOp(descriptorKey("DESC_WRITE",descriptor),false) {
+            @Override
+            boolean issue(BluetoothGatt gatt) {
+                descriptor.setValue(data);
+                return gatt.writeDescriptor(descriptor);
+            }
+
+            @Override
+            public void onFailed(String reason) {
+                deviceSignalCallback.signalCallback((short) 4,bleDevice.getAddress(),descriptor.getUuid().toString(),false,null);
+            }
+        });
     }
 
     /**
@@ -250,8 +358,11 @@ public class Device {
                 isConnectedDevice=true;//标志曾经连接上设备
                 mHandler.removeCallbacks(connectTimeoutCallback);//停止连接超时的定时
                 connectState=2;//将状态修改为已连接
+                curMtu=23;
+                mHandler.post(() -> gattQueue.clear());
                 connectStateCallback.connectSuccess(bleDevice.getAddress());//连接成功后的调用
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) { //断开连接
+                mHandler.post(() -> gattQueue.clear());
                 if(mBleGatt!=null){
                     mBleGatt.close();
                     mBleGatt=null;
@@ -312,6 +423,7 @@ public class Device {
         @Override
         public void onCharacteristicRead(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
             super.onCharacteristicRead(gatt, characteristic, status);
+            completeGattOperation(characteristicKey("READ",characteristic));
             if (status == BluetoothGatt.GATT_SUCCESS) //如果读取数据成功了
                 deviceSignalCallback.signalCallback((short) 0,bleDevice.getAddress(),characteristic.getUuid().toString(),true,characteristic.getValue());
              else//如果失败了
@@ -322,6 +434,7 @@ public class Device {
         @Override
         public void onCharacteristicWrite(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
                 super.onCharacteristicWrite(gatt, characteristic, status);
+                completeGattOperation(characteristicKey("WRITE",characteristic));
                 if (status == BluetoothGatt.GATT_SUCCESS) //如果写入数据成功了
                     deviceSignalCallback.signalCallback((short) 1,bleDevice.getAddress(),characteristic.getUuid().toString(),true,characteristic.getValue());
                  else //如果失败了
@@ -340,6 +453,7 @@ public class Device {
         @Override
         public void onDescriptorRead(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
             super.onDescriptorRead(gatt, descriptor, status);
+            completeGattOperation(descriptorKey("DESC_READ",descriptor));
             if (status == BluetoothGatt.GATT_SUCCESS) //如果读取数据成功了
                 deviceSignalCallback.signalCallback((short) 3,bleDevice.getAddress(),descriptor.getUuid().toString(),true,descriptor.getValue());
              else //如果失败了
@@ -350,7 +464,8 @@ public class Device {
         //写入特征值描述之后调用的函数
         @Override
         public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
-            super.onDescriptorRead(gatt, descriptor, status);
+            super.onDescriptorWrite(gatt, descriptor, status);
+            completeGattOperation(descriptorKey("DESC_WRITE",descriptor));
             if (status == BluetoothGatt.GATT_SUCCESS) //如果读取数据成功了
                 deviceSignalCallback.signalCallback((short) 4,bleDevice.getAddress(),descriptor.getUuid().toString(),true,descriptor.getValue());
              else //如果失败了
@@ -362,6 +477,9 @@ public class Device {
         @RequiresApi(api = Build.VERSION_CODES.LOLLIPOP)
         public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
             super.onMtuChanged(gatt, mtu, status);
+            if (status == BluetoothGatt.GATT_SUCCESS)
+                curMtu=mtu;
+            completeGattOperation("MTU");
             if (status == BluetoothGatt.GATT_SUCCESS) //如果mtu修改成功了
                 mtuChangeCallback.mtuChangeCallback(bleDevice.getAddress(),true,mtu);
             else //如果失败了

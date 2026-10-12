@@ -9,7 +9,10 @@ class FlutterBlueElves {
   late MethodChannel _channel;
   late EventChannel _eventChannelPlugin;
   late StreamSubscription _eventStreamSubscription;
-  late StreamController<ScanResult> _scanResultStreamController;
+  // Null until the first scan. Native delivers events asynchronously, so scan
+  // results it had already queued can arrive after this has been closed by
+  // stopScan or scanTimeout; those are dropped rather than added.
+  StreamController<ScanResult>? _scanResultStreamController;
   late Function(bool isOk) _androidApplyBluetoothPermissionCallback;
   late Function(bool isOk) _androidApplyLocationPermissionCallback;
   late Function(bool isOk) _androidOpenLocationServiceCallback;
@@ -93,7 +96,7 @@ class FlutterBlueElves {
 
   ///开始扫描设备,返回扫描结果流
   Stream<ScanResult> startScan(int timeout, {bool isAllowDuplicates = false}) {
-    _scanResultStreamController = StreamController<ScanResult>(
+    final controller = StreamController<ScanResult>(
         onListen: () {
           _channel.invokeMethod('startScan', {
             "isAllowDuplicates": isAllowDuplicates,
@@ -101,13 +104,14 @@ class FlutterBlueElves {
           });
         },
         onCancel: stopScan);
-    return _scanResultStreamController.stream;
+    _scanResultStreamController = controller;
+    return controller.stream;
   }
 
   ///停止扫描设备
   void stopScan() {
     _channel.invokeMethod('stopScan');
-    _scanResultStreamController.close();
+    _scanResultStreamController?.close();
   }
 
   ///获取因为被其他应用连接上而扫描不出来的设备
@@ -160,10 +164,13 @@ class FlutterBlueElves {
             message['uuids'],
             message['manufacturerSpecificData'],
             message['scanRecord']);
-        _scanResultStreamController.add(item); //将扫描到的新设备放到流中通知
+        final scanController = _scanResultStreamController;
+        if (scanController != null && !scanController.isClosed) {
+          scanController.add(item); //将扫描到的新设备放到流中通知
+        }
         break;
       case "scanTimeout":
-        _scanResultStreamController.close(); //扫描时间到了就关闭流,因为是单对单的流
+        _scanResultStreamController?.close(); //扫描时间到了就关闭流,因为是单对单的流
         break;
       case "connected":
         Device? deviceCache = _deviceCache[message['id']];
