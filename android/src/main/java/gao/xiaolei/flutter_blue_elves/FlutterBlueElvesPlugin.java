@@ -132,6 +132,16 @@ public class FlutterBlueElvesPlugin implements FlutterPlugin, MethodCallHandler,
                 boolean isFromScan=(boolean)connectParamsMap.get("isFromScan") ;
                 BluetoothDevice cache = isFromScan ? scanDeviceCaches.remove(connectDeviceId):hideConnectedDeviceCaches.remove(connectDeviceId);//从扫描结果或者隐藏结果中去连接只能执行一次
                 if (cache != null) {//如果这个id存在的话
+                    Device existing = devicesMap.get(connectDeviceId);
+                    if (existing != null && existing.isConnected()) {
+                        // Native side survived a Dart hot restart still holding this link: adopt
+                        // it rather than opening a second one on top.
+                        mConnectStateCallback.connectSuccess(connectDeviceId);
+                        result.success(true);
+                        break;
+                    }
+                    if (existing != null)
+                        existing.closeSilently();//replacing it would otherwise leak its BluetoothGatt
                     Device toConnectDevice = new Device(context, mHandler,cache, mConnectStateCallback, mDeviceSignalCallback, myDiscoverServiceCallback,mtuChangeCallback,rssiChangeCallback,(int) connectParamsMap.get("rssi"));
                     devicesMap.put(connectDeviceId,toConnectDevice);
                     int timeout=(int) connectParamsMap.get("timeout");
@@ -350,7 +360,11 @@ public class FlutterBlueElvesPlugin implements FlutterPlugin, MethodCallHandler,
         List<Map<String,Object>> result=new LinkedList<>();
         for (int i = 0,length=hideConnectedDevices.size(); i <length ; i++) {
             BluetoothDevice device=hideConnectedDevices.get(i);
-            if(!devicesMap.containsKey(device.getAddress())){//没有出现在缓存中的才返回
+            // Devices this plugin already tracks are returned too while their link is live:
+            // after a Dart hot restart the native side still holds them, and nothing else
+            // reaches them.
+            Device known=devicesMap.get(device.getAddress());
+            if(known==null||known.isConnected()){
                 hideConnectedDeviceCaches.put(device.getAddress(),device);
                 Map<String,Object> deviceMsg=new HashMap<>(4);
                 deviceMsg.put("id",device.getAddress());

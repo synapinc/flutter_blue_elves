@@ -115,8 +115,16 @@ class FlutterBlueElves {
   }
 
   ///获取因为被其他应用连接上而扫描不出来的设备
-  Future<List<HideConnectedDevice>> getHideConnectedDevices() {
-    return _channel.invokeMethod('getHideConnected').then((devices) {
+  ///
+  /// Also returns devices this plugin itself still holds a live link to, so a
+  /// Dart hot restart (which wipes the Dart cache but not the native one) can
+  /// reattach. [serviceUuids] are extra services to match on iOS, whose
+  /// retrieveConnectedPeripherals only finds peripherals by a discovered
+  /// service; 1800/1801 are always included. Ignored on Android.
+  Future<List<HideConnectedDevice>> getHideConnectedDevices(
+      {List<String>? serviceUuids}) {
+    return _channel.invokeMethod('getHideConnected',
+        {"serviceUuids": serviceUuids ?? <String>[]}).then((devices) {
       List<HideConnectedDevice> result = [];
       for (Map device in devices) {
         result.add(HideConnectedDevice(device["id"], device["name"],

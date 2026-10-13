@@ -134,6 +134,26 @@ public class Device {
         }
     }
 
+    public boolean isConnected(){
+        return connectState==2&&mBleGatt!=null;
+    }
+
+    /**
+     * Drops the link and releases the BluetoothGatt without any callback, for when this
+     * object is being replaced: a disconnected event would land on its successor, which
+     * shares the same id.
+     */
+    public void closeSilently(){
+        mHandler.removeCallbacks(connectTimeoutCallback);
+        gattQueue.clear();
+        if(mBleGatt!=null){
+            mBleGatt.disconnect();
+            mBleGatt.close();
+            mBleGatt=null;
+        }
+        connectState=0;
+    }
+
     /**
      * 更新设备对象
      */

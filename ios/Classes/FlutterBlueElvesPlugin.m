@@ -56,11 +56,20 @@
         [self stopScan];
         result(nil);
     }else if([@"getHideConnected" isEqualToString:call.method]){//如果是获取其他应用连接上的设备信息
-        NSArray<CBPeripheral *> * hideConnectedDevices=[self.centralManager retrieveConnectedPeripheralsWithServices:@[[CBUUID UUIDWithString:@"1800"],[CBUUID UUIDWithString:@"1801"]]];
+        NSMutableArray<CBUUID *> * services=[NSMutableArray arrayWithObjects:[CBUUID UUIDWithString:@"1800"],[CBUUID UUIDWithString:@"1801"],nil];
+        NSDictionary<NSString *,id> * hideArgs=[call.arguments isKindOfClass:[NSDictionary class]]?call.arguments:nil;
+        for (NSString * uuid in [hideArgs objectForKey:@"serviceUuids"]) {
+            [services addObject:[CBUUID UUIDWithString:uuid]];
+        }
+        NSArray<CBPeripheral *> * hideConnectedDevices=[self.centralManager retrieveConnectedPeripheralsWithServices:services];
         [self.hideConnectedDeviceCaches removeAllObjects];//先把之前缓存的设备结果列表清空
         NSMutableArray<NSMutableDictionary<NSString*,id>*> *hideDeviceMsgList=[NSMutableArray new];
         for (CBPeripheral * device in hideConnectedDevices) {
-            if([self.devicesMap objectForKey:[device.identifier UUIDString]]==nil){
+            // Devices this plugin already tracks are returned too while their link is live:
+            // after a Dart hot restart the native side still holds them, and nothing else can
+            // reach them (a connected peripheral does not advertise).
+            Device * known=[self.devicesMap objectForKey:[device.identifier UUIDString]];
+            if(known==nil||(known.state==2&&device.state==CBPeripheralStateConnected)){
                 [self.hideConnectedDeviceCaches setValue:device forKey:[device.identifier UUIDString]];
                 NSMutableDictionary<NSString*,id>* deviceMsg=[[NSMutableDictionary alloc] initWithCapacity:3];
                 [deviceMsg setValue:[device.identifier UUIDString] forKey:@"id"];
@@ -85,8 +94,15 @@
                 toConnectDevice=[[Device alloc] init:deviceId centralManager:self.centralManager peripheral:cache pluginInstance:self rssi:[dataMap objectForKey:@"rssi"]];
                 [self.devicesMap setValue:toConnectDevice forKey:deviceId];
             }
-            [toConnectDevice connectDevice:[[dataMap objectForKey:@"timeout"] intValue]];
+            if(toConnectDevice.state==2&&cache.state==CBPeripheralStateConnected){
+                // Already connected (native side survived a Dart hot restart): connectDevice would
+                // do nothing, so tell the new Dart Device it is connected.
+                [self sendDataToFlutter:@{@"eventName":@"connected",@"id":deviceId,@"mtu":[NSNumber numberWithLong:[cache maximumWriteValueLengthForType:CBCharacteristicWriteWithoutResponse]]}];
+            }else{
+                [toConnectDevice connectDevice:[[dataMap objectForKey:@"timeout"] intValue]];
+            }
             result([NSNumber numberWithBool:YES]);
+            return;
         }
         result([NSNumber numberWithBool:NO]);
     }else if([@"reConnect" isEqualToString:call.method]){//如果是去重连设备
